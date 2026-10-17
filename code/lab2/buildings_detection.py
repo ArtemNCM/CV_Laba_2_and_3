@@ -1,7 +1,7 @@
 # ----------------  Lab 2: виявлення будівель - растр -> вектор (KPI, KPI_esri)  ---------------
 
 '''
-Simplified algorithm: colour transformations + Canny + contours (no image enhancement,
+Simplified algorithm: colour transformations + Canny / Gabor + contours (no image enhancement,
 the photo is processed as it is).
 
  1. Colour transforms  - BGR -> HSV and Lab; roofs are grey/bluish
@@ -9,7 +9,8 @@ the photo is processed as it is).
                          (higher Lab-b), vegetation is saturated green
  2. Thresholds         - roof mask from S, Lab-b and brightness L (percentiles of the
                          region of interest, so they adapt to each photo)
- 3. Canny              - edges of the brightness channel; they cut the roof mask
+ 3. Edges              - Canny (default) or a Gabor filter bank (8 orientations, kernel as in
+                         the lecture example gabor_filter.py); the edges cut the roof mask
                          where a roof touches a road or another roof
  4. Morphology         - opening removes thin roads, closing fills small gaps
  5. findContours       - raster mask -> vector contours
@@ -28,6 +29,9 @@ Run:
     python buildings_detection.py             # process both photos, show results,
                                               # save everything to output/runX_lab2
     python buildings_detection.py --no-show   # only save, no windows
+    python research.py                        # R&D: colour corrections, Contours / Canny / Gabor
+
+After both photos the same buildings are compared on the two photos (object_comparison.py).
 '''
 
 import os
@@ -48,8 +52,15 @@ PARAMS = dict(
     s_max=75,              # roof: HSV saturation below this
     b_pct=50,              # roof: Lab-b below this percentile of the ROI (grey-blue, not yellow)
     l_pct=30,              # roof: Lab-L above this percentile (not shadow)
+    edges='canny',         # 'canny', 'gabor', 'both' or 'none' (contours of the colour mask only)
     canny_low=150,         # Canny thresholds
     canny_high=375,
+    gabor_ksize=21,        # Gabor kernel as in gabor_filter.py: 21x21, sigma 8, lambda 10, gamma 0.5
+    gabor_sigma=8.0,
+    gabor_lambda=10.0,
+    gabor_gamma=0.5,
+    gabor_orient=8,        # number of orientations in the filter bank
+    gabor_pct=97,          # strongest 3% of the Gabor response inside the ROI are edges
     edge_width=1,          # px, Canny edges are thickened to this width before cutting
     open_size=5,           # px, opening removes roads narrower than this
     close_size=9,          # px, closing fills small gaps in roofs
@@ -97,6 +108,33 @@ def canny_edges(image, p):
     gray = cv2.GaussianBlur(gray, (3, 3), 0)                            # as in Canny examples
     edges = cv2.Canny(gray, p['canny_low'], p['canny_high'])
     return cv2.dilate(edges, ellipse(p['edge_width']))
+
+
+def gabor_response(image, p):
+    # Gabor filter bank: maximum absolute response over p['gabor_orient'] orientations
+    gray = cv2.GaussianBlur(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), (3, 3), 0).astype(np.float32) / 255
+    resp = []
+    for k in range(p['gabor_orient']):
+        kernel = cv2.getGaborKernel((p['gabor_ksize'], p['gabor_ksize']), p['gabor_sigma'],
+                                    np.pi * k / p['gabor_orient'], p['gabor_lambda'], p['gabor_gamma'], 0,
+                                    ktype=cv2.CV_32F)
+        kernel -= kernel.mean()                          # no response on flat areas
+        resp.append(np.abs(cv2.filter2D(gray, cv2.CV_32F, kernel)))
+    return np.max(resp, axis=0)
+
+
+def gabor_edges(image, roi, p):
+    resp = gabor_response(image, p)
+    edges = (resp > np.percentile(resp[roi], p['gabor_pct'])).astype(np.uint8) * 255
+    return edges, resp
+
+
+def find_edges(image, roi, p):
+    # edge map used to cut the roof mask + Gabor response (for the figures)
+    gab, resp = gabor_edges(image, roi, p)
+    edges = {'canny': canny_edges(image, p), 'gabor': gab, 'none': np.zeros_like(gab)}
+    edges['both'] = edges['canny'] | gab
+    return edges[p['edges']], resp
 
 
 # --------------------------- 4. morphology -----------------------------------
@@ -182,22 +220,23 @@ def draw_debug(image, kept, rejected):
 def detect_buildings(image, roi, prm=PARAMS):
     p = scaled(prm, image.shape[1])
     mask, feats = colour_mask(image, roi, p)
-    edges = canny_edges(image, p)
+    edges, gabor = find_edges(image, roi, p)
     clean = clean_mask(mask, edges, p)
     kept, rejected = filter_contours(image_contours(clean), feats, roi, p)
     polys = vectorize(kept, p)
     final = np.zeros(mask.shape, np.uint8)
     cv2.drawContours(final, polys, -1, 255, -1)
-    stages = dict(colour_mask=mask, canny=edges, clean_mask=clean, final_mask=final,
+    gabor = np.uint8(255 * np.clip(gabor / max(np.percentile(gabor[roi], 99.5), 1e-6), 0, 1))
+    stages = dict(colour_mask=mask, canny=edges, gabor=gabor, clean_mask=clean, final_mask=final,
                   debug=draw_debug(image, kept, rejected))
     return polys, stages
 
 
 def stages_figure(name, st, result):
     from matplotlib import pyplot as plt
-    titles = ['Colour mask (HSV + Lab)', 'Canny edges', 'Mask cut by edges + morphology',
-              'Kept / rejected contours', 'Buildings']
-    imgs = [st['colour_mask'], st['canny'], st['clean_mask'], st['debug'], result]
+    titles = ['Colour mask (HSV + Lab)', f'Edges used: {PARAMS["edges"]}', 'Gabor filter response',
+              'Mask cut by edges + morphology', 'Kept / rejected contours', 'Buildings']
+    imgs = [st['colour_mask'], st['canny'], st['gabor'], st['clean_mask'], st['debug'], result]
     fig = plt.figure(figsize=(15, 9))
     for i, (t, im) in enumerate(zip(titles, imgs), 1):
         plt.subplot(2, 3, i)
@@ -217,7 +256,7 @@ def process(name, run_dir, log, reference=None):
     cv2.imwrite(os.path.join(run_dir, f'{name}_buildings.png'), result)
     cv2.imwrite(os.path.join(run_dir, f'{name}_mask.png'), st['final_mask'])
     cv2.imwrite(os.path.join(run_dir, f'{name}_debug_rejected.png'), st['debug'])
-    for k in ['colour_mask', 'canny', 'clean_mask']:
+    for k in ['colour_mask', 'canny', 'gabor', 'clean_mask']:
         cv2.imwrite(os.path.join(run_dir, f'{name}_step_{k}.png'), st[k])
     fig = stages_figure(name, st, result)
     fig.savefig(os.path.join(run_dir, f'{name}_stages.png'), dpi=100)
@@ -249,8 +288,14 @@ def main(show=True):
     except Exception as e:                               # reference is optional
         log(f'(reference comparison skipped: {e})')
 
-    for name in IMAGES:
-        process(name, run_dir, log, reference)
+    polys = {name: process(name, run_dir, log, reference) for name in IMAGES}
+    log('Building count: ' + ', '.join(f'{n} = {len(p)}' for n, p in polys.items()))
+
+    # the same buildings on the two photos: shape (Hu moments) and SIFT matching of the crops
+    import object_comparison
+    log('')
+    for line in object_comparison.compare(polys['KPI_esri'], polys['KPI'], run_dir):
+        log(line)
 
     with open(os.path.join(run_dir, 'report.txt'), 'w', encoding='utf-8') as fh:
         fh.write('\n'.join(lines) + '\n')
