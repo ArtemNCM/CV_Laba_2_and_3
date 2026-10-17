@@ -1,0 +1,10 @@
+# lab2 and lab3 (classical computer vision)
+opencv-python>=4.8
+numpy>=1.25
+matplotlib>=3.7
+Pillow>=10.0
+
+# model_detection only (neural network); CPU build of PyTorch:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# then:
+#   pip install -r code/model_detection/requirements.txt
